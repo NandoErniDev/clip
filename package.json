@@ -1,0 +1,26 @@
+{
+  "name": "clip",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "A private, temporary cross-device clipboard built on Cloudflare Workers, D1 and R2.",
+  "scripts": {
+    "dev": "npm run build && wrangler dev --port 8787 --ip 0.0.0.0",
+    "dev:client": "vite",
+    "build": "vite build",
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.worker.json",
+    "db:migrate:local": "wrangler d1 migrations apply clip-db --local",
+    "db:migrate:remote": "wrangler d1 migrations apply clip-db --remote",
+    "test:local": "node test/local.mjs",
+    "deploy": "npm run build && wrangler deploy"
+  },
+  "dependencies": {
+    "hono": "^4.9.6"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261123.1",
+    "typescript": "^5.9.2",
+    "vite": "^7.1.5",
+    "wrangler": "^4.40.0"
+  }
+}
