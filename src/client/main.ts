@@ -2,8 +2,8 @@ import { LIMITS } from "../shared/config";
 import type { ClipItem, ClipboardState } from "../shared/types";
 import * as api from "./api";
 
-const TOKEN_KEY = "clip.token";
-const POLL_INTERVAL_MS = 12_000;
+const STORE_KEY = "clip.code";
+const POLL_MS = 12_000;
 
 const root = (() => {
   const node = document.querySelector<HTMLDivElement>("#app");
@@ -17,26 +17,19 @@ interface PendingUpload {
 }
 
 const state: {
-  token: string | null;
+  code: string | null;
   clipboard: ClipboardState | null;
   pending: PendingUpload[];
   busy: boolean;
+  /** Full text of text items, so rows can be dragged out without a fetch. */
+  texts: Map<string, string>;
 } = {
-  token: null,
+  code: null,
   clipboard: null,
   pending: [],
   busy: false,
+  texts: new Map(),
 };
-
-const ICONS = {
-  copy: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="7" y="7" width="9" height="9" rx="2.2"/><path d="M13 4.6A2.1 2.1 0 0 0 11 3.5H5.6A2.1 2.1 0 0 0 3.5 5.6V11c0 .8.5 1.5 1.2 1.9"/></svg>',
-  download:
-    '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 3.5v8.2"/><path d="m6.6 8.9 3.4 3.4 3.4-3.4"/><path d="M4 14.2v1.1A1.7 1.7 0 0 0 5.7 17h8.6a1.7 1.7 0 0 0 1.7-1.7v-1.1"/></svg>',
-  trash:
-    '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.5 6h11"/><path d="M8 6V4.6a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1V6"/><path d="M6 6l.6 8.4a1.7 1.7 0 0 0 1.7 1.6h3.4a1.7 1.7 0 0 0 1.7-1.6L14 6"/></svg>',
-  mark:
-    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M15.8 8.2a4 4 0 0 0-5.6 0l-3.3 3.3a4 4 0 0 0 0 5.6"/><path d="M8.2 15.8a4 4 0 0 0 5.6 0l3.3-3.3a4 4 0 0 0 0-5.6"/></svg>',
-} as const;
 
 /* ------------------------------------------------------------------ helpers */
 
@@ -60,49 +53,32 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-function formatRemaining(ms: number): string {
-  if (ms <= 0) return "Expired";
-  const totalMinutes = Math.floor(ms / 60_000);
-  const hours = Math.floor(totalMinutes / 60);
-  const minutes = totalMinutes % 60;
-  if (hours > 0) return `${hours} h ${minutes.toString().padStart(2, "0")} m left`;
-  if (totalMinutes > 0) return `${totalMinutes} min left`;
-  return "Less than a minute left";
+function formatLeft(ms: number): string {
+  if (ms <= 0) return "expired";
+  const minutes = Math.floor(ms / 60_000);
+  if (minutes < 1) return "under a minute left";
+  const hours = Math.floor(minutes / 60);
+  if (hours > 0) return `${hours} h ${String(minutes % 60).padStart(2, "0")} m left`;
+  return `${minutes} min left`;
 }
 
-function formatRelative(timestamp: number): string {
+function formatWhen(timestamp: number): string {
   const diff = Date.now() - timestamp;
-  if (diff < 45_000) return "just now";
+  if (diff < 45_000) return "now";
   const minutes = Math.round(diff / 60_000);
-  if (minutes < 60) return `${minutes} min ago`;
+  if (minutes < 60) return `${minutes} min`;
   const hours = Math.round(minutes / 60);
-  if (hours < 24) return `${hours} h ago`;
-  return new Date(timestamp).toLocaleDateString(undefined, { month: "short", day: "numeric" });
-}
-
-function typeLabel(item: ClipItem): string {
-  if (item.kind === "text") return "Text";
-  const dot = item.name.lastIndexOf(".");
-  if (dot <= 0) return "File";
-  return item.name.slice(dot + 1).toUpperCase().slice(0, 5);
-}
-
-function dot(): HTMLElement {
-  return el("span", "meta__dot", "·");
+  return `${hours} h`;
 }
 
 function messageFor(error: unknown): string {
   if (error instanceof api.ApiError) return error.message;
-  if (error instanceof TypeError) return "Could not reach the server. Check your connection.";
-  return "Something went wrong. Please try again.";
+  if (error instanceof TypeError) return "No connection. Try again.";
+  return "Something went wrong.";
 }
 
-function composer(): HTMLElement | null {
-  return root?.querySelector<HTMLElement>("#composer") ?? null;
-}
-
-function composerInput(): HTMLTextAreaElement | null {
-  return root?.querySelector<HTMLTextAreaElement>("#composer-input") ?? null;
+function bytesOf(text: string): number {
+  return new TextEncoder().encode(text).byteLength;
 }
 
 /* -------------------------------------------------------------------- toasts */
@@ -119,8 +95,8 @@ function toast(message: string, tone: "info" | "error" = "info"): void {
   stack.append(item);
   window.setTimeout(() => {
     item.classList.add("toast--out");
-    window.setTimeout(() => item.remove(), 220);
-  }, 2600);
+    window.setTimeout(() => item.remove(), 240);
+  }, 2200);
 }
 
 async function writeClipboard(text: string): Promise<void> {
@@ -138,540 +114,545 @@ async function writeClipboard(text: string): Promise<void> {
   }
 }
 
-/* -------------------------------------------------------------------- dialogs */
+/* -------------------------------------------------------------------- sheets */
 
-function overlayHost(): HTMLElement {
+function sheet(html: string): { overlay: HTMLElement; dialog: HTMLElement; close: () => void } {
   const overlay = el("div", "overlay");
+  const dialog = el("div", "sheet");
+  dialog.setAttribute("role", "dialog");
+  dialog.setAttribute("aria-modal", "true");
+  dialog.innerHTML = html;
+  overlay.append(dialog);
   document.body.append(overlay);
-  return overlay;
-}
-
-function closeOnEscape(handler: () => void): () => void {
-  const listener = (event: KeyboardEvent): void => {
-    if (event.key === "Escape") handler();
-  };
-  document.addEventListener("keydown", listener);
-  return () => document.removeEventListener("keydown", listener);
-}
-
-function showTokenDialog(token: string): void {
-  const overlay = overlayHost();
-  const modal = el("div", "modal overlay__panel");
-  modal.innerHTML = `
-    <h2 class="modal__title">Your access token</h2>
-    <p class="modal__text">Open the clipboard on another device with this token. It is shown only once — keep it somewhere safe.</p>
-    <div class="token-box" data-token></div>
-    <div class="modal__actions">
-      <button class="btn btn--secondary" type="button" data-copy>Copy token</button>
-      <button class="btn btn--primary" type="button" data-done>Done</button>
-    </div>
-  `;
-  const tokenBox = modal.querySelector<HTMLElement>("[data-token]");
-  if (tokenBox) tokenBox.textContent = token;
 
   const close = (): void => {
-    removeListener();
+    document.removeEventListener("keydown", onKey);
     overlay.remove();
   };
-  const removeListener = closeOnEscape(close);
-
-  modal.querySelector("[data-copy]")?.addEventListener("click", () => {
-    void writeClipboard(token).then(() => toast("Token copied"));
-  });
-  modal.querySelector("[data-done]")?.addEventListener("click", close);
+  function onKey(event: KeyboardEvent): void {
+    if (event.key === "Escape") close();
+  }
+  document.addEventListener("keydown", onKey);
   overlay.addEventListener("click", (event) => {
     if (event.target === overlay) close();
   });
-
-  overlay.append(modal);
-  modal.querySelector<HTMLButtonElement>("[data-done]")?.focus();
+  return { overlay, dialog, close };
 }
 
-function confirmDialog(options: {
-  title: string;
-  message: string;
-  confirmLabel: string;
-  destructive?: boolean;
-}): Promise<boolean> {
+function showCode(code: string): void {
+  const { dialog, close } = sheet(`
+    <h2 class="sheet__title">Your code</h2>
+    <p class="sheet__text">Use this code on your other device. It is the only key to this clipboard.</p>
+    <div class="code-box" data-code></div>
+    <div class="sheet__actions">
+      <button class="btn" type="button" data-copy>Copy</button>
+      <button class="btn btn--fill" type="button" data-done>Done</button>
+    </div>
+  `);
+  const box = dialog.querySelector<HTMLElement>("[data-code]");
+  if (box) box.textContent = code;
+
+  dialog.querySelector("[data-copy]")?.addEventListener("click", () => {
+    void writeClipboard(code).then(() => toast("Code copied"));
+  });
+  dialog.querySelector("[data-done]")?.addEventListener("click", close);
+  dialog.querySelector<HTMLButtonElement>("[data-done]")?.focus();
+}
+
+function confirmSheet(options: { title: string; text: string; confirm: string }): Promise<boolean> {
   return new Promise((resolve) => {
-    const overlay = overlayHost();
-    const modal = el("div", "modal overlay__panel");
-    modal.innerHTML = `
-      <h2 class="modal__title" data-title></h2>
-      <p class="modal__text" data-message></p>
-      <div class="modal__actions">
-        <button class="btn btn--secondary" type="button" data-cancel>Cancel</button>
-        <button class="btn ${options.destructive ? "btn--danger" : "btn--primary"}" type="button" data-confirm></button>
+    const { dialog } = sheet(`
+      <h2 class="sheet__title" data-title></h2>
+      <p class="sheet__text" data-text></p>
+      <div class="sheet__actions">
+        <button class="btn" type="button" data-cancel>Cancel</button>
+        <button class="btn btn--danger" type="button" data-confirm></button>
       </div>
-    `;
-    const title = modal.querySelector("[data-title]");
-    const message = modal.querySelector("[data-message]");
-    const confirm = modal.querySelector<HTMLButtonElement>("[data-confirm]");
+    `);
+    const title = dialog.querySelector("[data-title]");
+    const text = dialog.querySelector("[data-text]");
+    const confirm = dialog.querySelector<HTMLButtonElement>("[data-confirm]");
     if (title) title.textContent = options.title;
-    if (message) message.textContent = options.message;
-    if (confirm) confirm.textContent = options.confirmLabel;
+    if (text) text.textContent = options.text;
+    if (confirm) confirm.textContent = options.confirm;
 
-    const finish = (value: boolean): void => {
-      removeListener();
-      overlay.remove();
-      resolve(value);
-    };
-    const removeListener = closeOnEscape(() => finish(false));
-
-    modal.querySelector("[data-cancel]")?.addEventListener("click", () => finish(false));
-    confirm?.addEventListener("click", () => finish(true));
-    overlay.addEventListener("click", (event) => {
-      if (event.target === overlay) finish(false);
+    dialog.querySelector("[data-cancel]")?.addEventListener("click", () => {
+      finish(false);
     });
+    confirm?.addEventListener("click", () => finish(true));
 
-    overlay.append(modal);
+    let settled = false;
+    function finish(value: boolean): void {
+      if (settled) return;
+      settled = true;
+      document.querySelectorAll(".overlay").forEach((node) => node.remove());
+      resolve(value);
+    }
     confirm?.focus();
   });
 }
 
 function openViewer(item: ClipItem): void {
-  const overlay = overlayHost();
-  overlay.classList.add("overlay--viewer");
+  const overlay = el("div", "overlay overlay--viewer");
   const image = el("img", "viewer__image");
   image.src = item.contentUrl;
   image.alt = item.name;
-  const close = (): void => {
-    removeListener();
-    overlay.remove();
-  };
-  const removeListener = closeOnEscape(close);
-  overlay.addEventListener("click", close);
   overlay.append(image);
+  overlay.addEventListener("click", () => overlay.remove());
+  document.addEventListener(
+    "keydown",
+    function onKey(event: KeyboardEvent): void {
+      if (event.key === "Escape") {
+        overlay.remove();
+        document.removeEventListener("keydown", onKey);
+      }
+    },
+  );
+  document.body.append(overlay);
 }
 
-/* --------------------------------------------------------------- auth screen */
+/* -------------------------------------------------------------------- landing */
 
-function renderAuth(message?: string): void {
+function renderLanding(options: { message?: string; code?: string } = {}): void {
   stopPolling();
   state.clipboard = null;
+  state.texts.clear();
   root.replaceChildren();
 
-  const main = el("main", "auth");
-  const card = el("section", "auth__card");
-  card.innerHTML = `
-    <div class="mark">${ICONS.mark}</div>
-    <h1 class="auth__title">Clip</h1>
-    <p class="auth__lede">A private, temporary clipboard between your devices. Everything is deleted automatically after ${LIMITS.clipboardTtlMs / 3_600_000} hours.</p>
-    <form id="connect-form" class="stack" novalidate>
-      <label class="field">
-        <span class="field__label">Access token</span>
-        <input id="token-input" class="input input--mono" type="text" name="token" placeholder="CLIP-XXXX-XXXX-XXXX-XXXX" autocomplete="off" autocapitalize="characters" spellcheck="false" required />
-      </label>
-      <p class="form-error" id="auth-error" role="alert" hidden></p>
-      <button class="btn btn--primary btn--block" type="submit" id="connect-btn">Connect</button>
-    </form>
-    <div class="divider"><span>or</span></div>
-    <button class="btn btn--secondary btn--block" id="create-btn" type="button">Create a new clipboard</button>
-    <p class="fineprint">The token is the only key to a clipboard. Only its SHA-256 hash is stored on the server.</p>
+  const page = el("main", "landing");
+  page.innerHTML = `
+    <div class="landing__inner">
+      <h1 class="wordmark">clip</h1>
+      <p class="tagline">A private clipboard between your devices.<br />Everything is gone after ${LIMITS.clipboardTtlMs / 3_600_000} hours.</p>
+      <form class="entry" id="entry" novalidate>
+        <label class="sr-only" for="code">Code</label>
+        <input id="code" class="entry__input" type="text" name="code" placeholder="Code"
+          autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="go" />
+        <div class="entry__actions">
+          <button class="btn btn--fill" type="submit" id="connect">Connect</button>
+          <button class="btn" type="button" id="create">New clipboard</button>
+        </div>
+        <p class="entry__hint" id="hint"></p>
+      </form>
+    </div>
   `;
-  main.append(card);
-  root.append(main);
+  root.append(page);
 
-  const form = card.querySelector<HTMLFormElement>("#connect-form");
-  const input = card.querySelector<HTMLInputElement>("#token-input");
-  const errorNode = card.querySelector<HTMLElement>("#auth-error");
-  const connectButton = card.querySelector<HTMLButtonElement>("#connect-btn");
-  const createButton = card.querySelector<HTMLButtonElement>("#create-btn");
+  const form = page.querySelector<HTMLFormElement>("#entry");
+  const input = page.querySelector<HTMLInputElement>("#code");
+  const hint = page.querySelector<HTMLElement>("#hint");
+  const connectButton = page.querySelector<HTMLButtonElement>("#connect");
+  const createButton = page.querySelector<HTMLButtonElement>("#create");
 
-  if (message && errorNode) {
-    errorNode.textContent = message;
-    errorNode.hidden = false;
+  if (input) input.value = options.code ?? "";
+  setHint(hint, options.message ?? "", Boolean(options.message));
+
+  function setHint(node: HTMLElement | null, message: string, isError: boolean): void {
+    if (!node) return;
+    node.textContent = message;
+    node.classList.toggle("is-error", isError);
   }
+
+  const describe = (): void => {
+    const value = input?.value.trim() ?? "";
+    if (!value) {
+      setHint(hint, "Leave the field empty to get a random code.", false);
+    } else if (value.length < 3) {
+      setHint(hint, "Codes are at least 3 characters.", false);
+    } else {
+      setHint(hint, value.toLowerCase(), false);
+    }
+  };
+  describe();
+  input?.addEventListener("input", describe);
 
   form?.addEventListener("submit", (event) => {
     event.preventDefault();
-    const token = input?.value.trim() ?? "";
-    if (!token) {
-      if (errorNode) {
-        errorNode.textContent = "Enter an access token to continue.";
-        errorNode.hidden = false;
-      }
+    const value = input?.value.trim() ?? "";
+    if (!value) {
+      setHint(hint, "Enter a code, or create a new clipboard.", true);
       input?.focus();
       return;
     }
-    void connectWithToken(token, errorNode, connectButton);
+    void connect(value, connectButton, hint);
   });
 
   createButton?.addEventListener("click", () => {
-    void createNewClipboard(createButton, errorNode);
+    const value = input?.value.trim() ?? "";
+    void create(value || undefined, createButton, hint);
   });
 
   input?.focus();
 }
 
-function setAuthError(node: HTMLElement | null, message?: string): void {
-  if (!node) return;
-  node.textContent = message ?? "";
-  node.hidden = !message;
-}
-
-async function connectWithToken(
-  token: string,
-  errorNode: HTMLElement | null,
-  button: HTMLButtonElement | null,
-): Promise<void> {
-  setAuthError(errorNode);
-  if (button) {
-    button.disabled = true;
-    button.textContent = "Connecting…";
-  }
+async function connect(code: string, button: HTMLButtonElement | null, hint: HTMLElement | null): Promise<void> {
+  setBusy(button, true, "Connecting…");
   try {
-    const response = await api.connect(token);
-    rememberToken(token);
-    state.token = token;
+    const response = await api.connect(code);
+    remember(code);
+    state.code = code;
     state.clipboard = response.clipboard;
     renderWorkspace();
   } catch (error) {
-    setAuthError(errorNode, messageFor(error));
-  } finally {
-    if (button) {
-      button.disabled = false;
-      button.textContent = "Connect";
+    if (hint) {
+      hint.textContent = messageFor(error);
+      hint.classList.add("is-error");
     }
+  } finally {
+    setBusy(button, false, "Connect");
   }
 }
 
-async function createNewClipboard(button: HTMLButtonElement | null, errorNode: HTMLElement | null): Promise<void> {
-  setAuthError(errorNode);
-  if (button) {
-    button.disabled = true;
-    button.textContent = "Creating…";
-  }
+async function create(code: string | undefined, button: HTMLButtonElement | null, hint: HTMLElement | null): Promise<void> {
+  setBusy(button, true, "Creating…");
   try {
-    const response = await api.createClipboard();
-    rememberToken(response.token);
-    state.token = response.token;
+    const response = await api.createClipboard(code);
+    remember(response.token);
+    state.code = response.token;
     state.clipboard = response.clipboard;
     renderWorkspace();
-    showTokenDialog(response.token);
+    showCode(response.token);
   } catch (error) {
-    setAuthError(errorNode, messageFor(error));
-  } finally {
-    if (button) {
-      button.disabled = false;
-      button.textContent = "Create a new clipboard";
+    if (hint) {
+      hint.textContent = messageFor(error);
+      hint.classList.add("is-error");
     }
+  } finally {
+    setBusy(button, false, "New clipboard");
   }
 }
 
-function rememberToken(token: string): void {
+function setBusy(button: HTMLButtonElement | null, busy: boolean, label: string): void {
+  if (!button) return;
+  button.disabled = busy;
+  button.textContent = label;
+}
+
+function remember(code: string): void {
   try {
-    localStorage.setItem(TOKEN_KEY, token);
+    localStorage.setItem(STORE_KEY, code);
   } catch {
-    // Storage can be unavailable in private modes; the session cookie still works.
+    // Private modes may block storage; the session cookie still works.
   }
 }
 
-function forgetToken(): void {
+function forget(): void {
   try {
-    localStorage.removeItem(TOKEN_KEY);
+    localStorage.removeItem(STORE_KEY);
   } catch {
     // ignore
   }
 }
 
-/* --------------------------------------------------------------- workspace */
+/* ------------------------------------------------------------------ workspace */
 
 function renderWorkspace(): void {
   root.replaceChildren();
 
-  const shell = el("div", "shell");
-  shell.innerHTML = `
-    <header class="bar">
-      <div class="brand">
-        <span class="brand__mark">${ICONS.mark}</span>
-        <span class="brand__name">Clip</span>
-      </div>
-      <div class="bar__meta">
-        <span class="status"><span class="status__dot"></span>Connected</span>
-        <button class="btn btn--ghost btn--sm" type="button" id="disconnect">Disconnect</button>
-      </div>
-    </header>
+  const page = el("div", "page");
+  page.innerHTML = `
+    <div class="page__inner">
+      <header class="topbar">
+        <span class="topbar__brand">clip</span>
+        <span class="topbar__right">
+          <button class="topbar__code" type="button" id="code-chip" title="Copy code"></button>
+          <button class="topbar__leave" type="button" id="leave" aria-label="Disconnect">×</button>
+        </span>
+      </header>
 
-    <section class="usage" aria-label="Clipboard usage">
-      <div class="usage__row">
-        <span class="usage__expiry" id="expiry">—</span>
-        <span class="usage__storage" id="storage">—</span>
-      </div>
-      <div class="meter"><div class="meter__fill" id="meter"></div></div>
-      <div class="usage__row usage__row--sub">
-        <span id="item-count">—</span>
-        <button class="link" type="button" id="copy-token">Copy token</button>
-      </div>
-    </section>
-
-    <section class="composer" id="composer">
-      <label class="sr-only" for="composer-input">Paste or type text</label>
-      <textarea id="composer-input" placeholder="Paste or type text…" rows="4" spellcheck="true"></textarea>
-      <div class="composer__footer">
-        <span class="composer__hint" id="composer-hint">Paste anywhere · drop files</span>
-        <div class="composer__actions">
-          <label class="btn btn--secondary btn--sm" for="file-input">Upload</label>
-          <input id="file-input" type="file" multiple hidden />
-          <button class="btn btn--primary btn--sm" type="button" id="add-text" disabled>Add text</button>
+      <section class="composer" id="composer">
+        <label class="sr-only" for="composer-input">Text or file</label>
+        <textarea id="composer-input" rows="3" placeholder="Type something, or drop a file here."></textarea>
+        <div class="composer__row">
+          <span class="composer__hint" id="composer-hint"></span>
+          <span class="composer__actions">
+            <label class="btn btn--quiet" for="file-input">File</label>
+            <input id="file-input" type="file" multiple hidden />
+            <button class="btn btn--fill btn--small" type="button" id="save" disabled>Save</button>
+          </span>
         </div>
-      </div>
-      <div class="dropzone" aria-hidden="true"><span>Drop to add to this clipboard</span></div>
-    </section>
+        <div class="composer__drop"><span>Drop to add</span></div>
+      </section>
 
-    <section class="list" aria-label="Clipboard items">
-      <div class="list__head">
-        <h2>Items</h2>
-        <button class="link link--danger" type="button" id="clear-all">Clear all</button>
-      </div>
-      <div class="items" id="items"></div>
-    </section>
+      <section class="items" id="items" aria-label="Clipboard items"></section>
 
-    <footer class="foot">Files are stored in Cloudflare R2, metadata in D1. Expired content is deleted automatically.</footer>
+      <footer class="footer">
+        <span id="status"></span>
+        <button class="footer__clear" type="button" id="clear">Clear all</button>
+      </footer>
+    </div>
   `;
-  root.append(shell);
+  root.append(page);
 
-  wireWorkspace(shell);
+  wireWorkspace(page);
   updateWorkspace();
   startPolling();
 }
 
-function wireWorkspace(shell: HTMLElement): void {
-  shell.querySelector("#disconnect")?.addEventListener("click", () => {
+function wireWorkspace(page: HTMLElement): void {
+  const input = page.querySelector<HTMLTextAreaElement>("#composer-input");
+
+  page.querySelector("#code-chip")?.addEventListener("click", () => {
+    if (!state.code) return;
+    void writeClipboard(state.code).then(() => toast("Code copied"));
+  });
+
+  page.querySelector("#leave")?.addEventListener("click", () => {
     void disconnect();
   });
 
-  shell.querySelector("#copy-token")?.addEventListener("click", () => {
-    if (!state.token) return;
-    void writeClipboard(state.token).then(() => toast("Token copied"));
-  });
-
-  const input = shell.querySelector<HTMLTextAreaElement>("#composer-input");
-  input?.addEventListener("input", updateComposerState);
+  input?.addEventListener("input", updateComposer);
   input?.addEventListener("keydown", (event) => {
     if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
       event.preventDefault();
-      void addText(input.value);
+      void saveText();
     }
   });
 
-  shell.querySelector("#add-text")?.addEventListener("click", () => {
-    if (input) void addText(input.value);
+  page.querySelector("#save")?.addEventListener("click", () => {
+    void saveText();
   });
 
-  shell.querySelector<HTMLInputElement>("#file-input")?.addEventListener("change", (event) => {
+  page.querySelector<HTMLInputElement>("#file-input")?.addEventListener("change", (event) => {
     const target = event.target as HTMLInputElement;
     const files = Array.from(target.files ?? []);
     if (files.length > 0) void uploadFiles(files);
     target.value = "";
   });
 
-  shell.querySelector("#clear-all")?.addEventListener("click", () => {
+  page.querySelector("#clear")?.addEventListener("click", () => {
     void clearAll();
   });
 
-  shell.querySelector("#items")?.addEventListener("click", (event) => {
-    const button = (event.target as HTMLElement).closest<HTMLElement>("[data-action]");
-    const row = button?.closest<HTMLElement>("[data-id]");
-    if (!button || !row) return;
-    const id = row.dataset.id;
-    const item = state.clipboard?.items.find((entry) => entry.id === id);
+  page.querySelector("#items")?.addEventListener("click", (event) => {
+    const target = event.target as HTMLElement;
+    const row = target.closest<HTMLElement>(".item");
+    if (!row) return;
+    const item = state.clipboard?.items.find((entry) => entry.id === row.dataset.id);
     if (!item) return;
 
-    const action = button.dataset.action;
-    if (action === "copy") void copyItem(item);
-    if (action === "download") downloadItem(item);
-    if (action === "delete") void deleteItem(item);
-    if (action === "preview") openViewer(item);
+    if (target.closest("[data-delete]")) {
+      void removeItem(item);
+      return;
+    }
+    if (target.closest("[data-preview]")) {
+      openViewer(item);
+      return;
+    }
+    void copyItem(item, row);
   });
 
-  updateComposerState();
+  page.querySelector("#items")?.addEventListener("keydown", (rawEvent) => {
+    const event = rawEvent as KeyboardEvent;
+    if (event.key !== "Enter" && event.key !== " ") return;
+    const row = (event.target as HTMLElement).closest<HTMLElement>(".item");
+    if (!row) return;
+    event.preventDefault();
+    const item = state.clipboard?.items.find((entry) => entry.id === row.dataset.id);
+    if (item) void copyItem(item, row);
+  });
+
+  updateComposer();
 }
 
 function updateWorkspace(): void {
   const clipboard = state.clipboard;
-  const expiry = root.querySelector<HTMLElement>("#expiry");
-  if (!clipboard || !expiry) return;
+  if (!clipboard) return;
 
-  const remaining = clipboard.expiresAt - Date.now();
-  expiry.textContent = remaining > 0 ? `Expires in ${formatRemaining(remaining)}` : "Expired";
+  const chip = root.querySelector<HTMLElement>("#code-chip");
+  if (chip) chip.textContent = state.code ?? "";
 
-  const used = clipboard.usedBytes;
-  const max = clipboard.limits.maxTotalBytes;
-  const percent = Math.min(100, (used / max) * 100);
-
-  const storage = root.querySelector<HTMLElement>("#storage");
-  if (storage) storage.textContent = `${formatBytes(used)} of ${formatBytes(max)} used`;
-
-  const meter = root.querySelector<HTMLElement>("#meter");
-  if (meter) {
-    // Avoid a stray one-pixel sliver when the clipboard is essentially empty.
-    meter.style.width = percent < 0.5 ? "0%" : `${percent}%`;
-    meter.classList.toggle("meter__fill--high", percent >= 90);
+  const status = root.querySelector<HTMLElement>("#status");
+  if (status) {
+    status.textContent = `${formatLeft(clipboard.expiresAt - Date.now())} · ${clipboard.itemCount}/${clipboard.limits.maxItems} · ${formatBytes(clipboard.usedBytes)}`;
   }
 
-  const count = root.querySelector<HTMLElement>("#item-count");
-  if (count) count.textContent = `${clipboard.itemCount} of ${clipboard.limits.maxItems} items`;
+  const clear = root.querySelector<HTMLButtonElement>("#clear");
+  if (clear) clear.hidden = clipboard.itemCount === 0 && state.pending.length === 0;
 
   renderItems();
-}
-
-function itemSignature(): string {
-  const clipboard = state.clipboard;
-  if (!clipboard) return "";
-  const ids = clipboard.items.map((item) => `${item.id}:${item.size}`).join(",");
-  const pending = state.pending.map((entry) => entry.id).join(",");
-  return `${ids}|${pending}|${Math.floor(Date.now() / 60_000)}`;
 }
 
 let lastSignature = "";
 
 function renderItems(force = false): void {
   const clipboard = state.clipboard;
-  const container = root.querySelector<HTMLElement>("#items");
-  if (!clipboard || !container) return;
+  const list = root.querySelector<HTMLElement>("#items");
+  if (!clipboard || !list) return;
 
-  const signature = itemSignature();
+  const signature = [
+    clipboard.items.map((item) => `${item.id}:${item.size}`).join(","),
+    state.pending.map((entry) => entry.id).join(","),
+  ].join("|");
   if (!force && signature === lastSignature) return;
   lastSignature = signature;
 
-  container.replaceChildren();
+  list.replaceChildren();
 
   for (const pending of state.pending) {
-    container.append(pendingRow(pending));
+    const row = el("div", "item is-pending");
+    const thumb = el("div", "item__thumb");
+    thumb.append(el("span", "spinner"));
+    const body = el("div", "item__body");
+    body.append(el("p", "item__line", pending.name), el("span", "item__meta", "Uploading…"));
+    row.append(thumb, body);
+    list.append(row);
   }
 
   for (const item of clipboard.items) {
-    container.append(itemRow(item));
+    list.append(itemRow(item));
   }
 
   if (clipboard.items.length === 0 && state.pending.length === 0) {
     const empty = el("div", "empty");
     empty.append(
-      el("p", "empty__title", "Nothing here yet"),
-      el(
-        "p",
-        "empty__hint",
-        "Paste text anywhere on this page, drop a file, or use Upload. It appears on your other devices within seconds.",
-      ),
+      el("p", "empty__title", "Nothing yet"),
+      el("p", "empty__text", "Anything you add appears on your other devices within seconds."),
     );
-    container.append(empty);
+    list.append(empty);
   }
-}
 
-function pendingRow(pending: PendingUpload): HTMLElement {
-  const row = el("div", "item item--pending");
-  const thumb = el("div", "thumb thumb--static");
-  thumb.append(el("span", "spinner"));
-  const body = el("div", "item__body");
-  body.append(el("div", "item__name", pending.name), el("div", "item__meta", "Uploading…"));
-  row.append(thumb, body);
-  return row;
+  prefetchTexts();
 }
 
 function itemRow(item: ClipItem): HTMLElement {
   const row = el("div", "item");
   row.dataset.id = item.id;
+  row.tabIndex = 0;
+  row.draggable = true;
+  row.setAttribute("role", "button");
+  row.setAttribute("aria-label", item.kind === "text" ? "Copy text" : `Copy ${item.name}`);
 
-  const thumb = item.inline ? el("button", "thumb") : el("div", "thumb thumb--static");
-  if (thumb instanceof HTMLButtonElement) {
-    thumb.type = "button";
-    thumb.dataset.action = "preview";
-    thumb.setAttribute("aria-label", `Preview ${item.name}`);
+  const thumb = el("div", "item__thumb");
+  if (item.inline) {
+    const button = el("button", "item__preview");
+    button.type = "button";
+    button.dataset.preview = "1";
+    button.setAttribute("aria-label", `Preview ${item.name}`);
     const image = el("img");
     image.src = item.contentUrl;
     image.alt = item.name;
     image.loading = "lazy";
-    thumb.append(image);
+    button.append(image);
+    thumb.append(button);
   } else {
-    thumb.append(el("span", "thumb__label", typeLabel(item)));
+    thumb.append(el("span", "item__label", typeLabel(item)));
   }
 
   const body = el("div", "item__body");
   if (item.kind === "text") {
-    body.append(el("p", "item__text", item.preview ?? ""));
+    body.append(el("p", "item__line", oneLine(item.preview ?? "")));
   } else {
-    body.append(el("div", "item__name", item.name));
+    body.append(el("p", "item__line", item.name));
   }
+  body.append(
+    el(
+      "span",
+      "item__meta",
+      `${item.kind === "text" ? `${formatBytes(item.size)} text` : formatBytes(item.size)} · ${formatWhen(item.createdAt)} ago`,
+    ),
+  );
 
-  const meta = el("div", "item__meta");
-  meta.append(el("span", null, typeLabel(item)), dot(), el("span", null, formatBytes(item.size)), dot(), el("span", null, formatRelative(item.createdAt)));
-  body.append(meta);
+  const remove = el("button", "item__delete", "×");
+  remove.type = "button";
+  remove.dataset.delete = "1";
+  remove.setAttribute("aria-label", `Delete ${item.name}`);
 
-  const actions = el("div", "item__actions");
+  row.append(thumb, body, remove);
 
-  if (item.kind === "text") {
-    actions.append(actionButton("copy", `Copy text`, ICONS.copy, "Copy"));
-  }
-  actions.append(actionButton("download", `Download ${item.name}`, ICONS.download, "Download"));
-  actions.append(actionButton("delete", `Delete ${item.name}`, ICONS.trash, "Delete", true));
+  row.addEventListener("dragstart", (event) => {
+    const data = event.dataTransfer;
+    if (!data) return;
+    data.effectAllowed = "copy";
+    row.classList.add("is-dragging");
 
-  row.append(thumb, body, actions);
+    if (item.kind === "text") {
+      data.setData("text/plain", state.texts.get(item.id) ?? item.preview ?? "");
+      data.setData("text/uri-list", absolute(item.contentUrl));
+    } else {
+      data.setData("DownloadURL", `${item.mime}:${item.name}:${absolute(api.downloadUrl(item))}`);
+      data.setData("text/uri-list", absolute(api.downloadUrl(item)));
+      data.setData("text/plain", item.name);
+    }
+  });
+  row.addEventListener("dragend", () => row.classList.remove("is-dragging"));
+
   return row;
 }
 
-function actionButton(action: string, label: string, icon: string, text: string, danger = false): HTMLButtonElement {
-  const button = el("button", `icon-btn${danger ? " icon-btn--danger" : ""}`);
-  button.type = "button";
-  button.dataset.action = action;
-  button.setAttribute("aria-label", label);
-  button.title = label;
-  button.innerHTML = `${icon}<span class="icon-btn__text">${text}</span>`;
-  return button;
+function oneLine(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
 }
 
-function updateComposerState(): void {
-  const input = composerInput();
-  const button = root.querySelector<HTMLButtonElement>("#add-text");
+function typeLabel(item: ClipItem): string {
+  if (item.kind === "text") return "TXT";
+  const dot = item.name.lastIndexOf(".");
+  if (dot <= 0) return "FILE";
+  return item.name.slice(dot + 1).toUpperCase().slice(0, 4);
+}
+
+function absolute(path: string): string {
+  return new URL(path, window.location.href).href;
+}
+
+function prefetchTexts(): void {
+  const clipboard = state.clipboard;
+  if (!clipboard) return;
+  for (const item of clipboard.items) {
+    if (item.kind !== "text" || state.texts.has(item.id)) continue;
+    if (item.size > 128 * 1024) continue;
+    void api
+      .fetchText(item)
+      .then((text) => state.texts.set(item.id, text))
+      .catch(() => undefined);
+  }
+}
+
+/* --------------------------------------------------------------------- input */
+
+function updateComposer(): void {
+  const input = root.querySelector<HTMLTextAreaElement>("#composer-input");
+  const save = root.querySelector<HTMLButtonElement>("#save");
   const hint = root.querySelector<HTMLElement>("#composer-hint");
   if (!input) return;
 
-  const bytes = new TextEncoder().encode(input.value).byteLength;
-  const empty = input.value.trim().length === 0;
+  const value = input.value;
+  const bytes = bytesOf(value);
+  const empty = value.trim().length === 0;
+  const tooLarge = bytes > LIMITS.maxTextBytes;
+  const full = (state.clipboard?.itemCount ?? 0) >= LIMITS.maxItems;
 
-  if (button) button.disabled = empty || state.busy || bytes > LIMITS.maxTextBytes;
+  if (save) save.disabled = empty || tooLarge || state.busy || full;
 
   if (hint) {
-    if (empty) {
-      hint.textContent = "Paste anywhere · drop files";
-    } else if (bytes > LIMITS.maxTextBytes) {
-      hint.textContent = `Text is too long — ${Math.round(LIMITS.maxTextBytes / 1024)} KB maximum`;
-    } else {
-      hint.textContent = `${formatBytes(bytes)} of ${Math.round(LIMITS.maxTextBytes / 1024)} KB`;
-    }
+    if (tooLarge) hint.textContent = `Too long — ${Math.round(LIMITS.maxTextBytes / 1024)} KB max`;
+    else if (full) hint.textContent = "This clipboard is full";
+    else if (empty) hint.textContent = "⌘ ↵ to save";
+    else hint.textContent = `${formatBytes(bytes)} · ⌘ ↵ to save`;
   }
 }
 
-/* ------------------------------------------------------------------ actions */
-
-async function addText(text: string): Promise<void> {
+async function saveText(): Promise<void> {
   if (!state.clipboard) return;
-  const clean = text.replace(/\u0000/g, "");
-  if (!clean.trim()) return;
-
-  const bytes = new TextEncoder().encode(clean).byteLength;
-  if (bytes > LIMITS.maxTextBytes) {
-    toast(`Text can be up to ${Math.round(LIMITS.maxTextBytes / 1024)} KB`, "error");
-    return;
-  }
+  const input = root.querySelector<HTMLTextAreaElement>("#composer-input");
+  if (!input) return;
+  const text = input.value.replace(/\u0000/g, "");
+  if (!text.trim()) return;
 
   state.busy = true;
-  updateComposerState();
+  updateComposer();
   try {
-    const result = await api.addText(clean);
+    const result = await api.addText(text);
     state.clipboard = result.clipboard;
-    const input = composerInput();
-    if (input) {
-      input.value = "";
-      input.focus();
-    }
+    input.value = "";
+    input.focus();
     updateWorkspace();
     toast("Saved");
   } catch (error) {
     handleError(error);
   } finally {
     state.busy = false;
-    updateComposerState();
+    updateComposer();
   }
 }
 
@@ -679,12 +660,12 @@ async function uploadFiles(files: File[]): Promise<void> {
   if (!state.clipboard) return;
 
   for (const file of files) {
-    if (file.size > LIMITS.maxFileBytes) {
-      toast(`${file.name} is larger than ${Math.round(LIMITS.maxFileBytes / (1024 * 1024))} MB`, "error");
-      continue;
-    }
     if (file.size === 0) {
       toast(`${file.name} is empty`, "error");
+      continue;
+    }
+    if (file.size > LIMITS.maxFileBytes) {
+      toast(`${file.name} is over ${Math.round(LIMITS.maxFileBytes / (1024 * 1024))} MB`, "error");
       continue;
     }
 
@@ -695,7 +676,6 @@ async function uploadFiles(files: File[]): Promise<void> {
     try {
       const result = await api.uploadFile(file);
       state.clipboard = result.clipboard;
-      toast(`Added ${file.name}`);
     } catch (error) {
       handleError(error);
     } finally {
@@ -705,13 +685,30 @@ async function uploadFiles(files: File[]): Promise<void> {
   }
 }
 
-async function copyItem(item: ClipItem): Promise<void> {
+async function copyItem(item: ClipItem, row: HTMLElement): Promise<void> {
   try {
-    const text = await api.fetchText(item);
-    await writeClipboard(text);
-    toast("Copied to clipboard");
+    if (item.kind === "text") {
+      const text = state.texts.get(item.id) ?? (await api.fetchText(item));
+      state.texts.set(item.id, text);
+      await writeClipboard(text);
+    } else if (item.inline) {
+      const blob = await api.fetchBlob(item);
+      await navigator.clipboard.write([new ClipboardItem({ [blob.type || "image/png"]: blob })]);
+    } else {
+      downloadItem(item);
+      toast("Downloading");
+      return;
+    }
+
+    row.classList.add("is-copied");
+    window.setTimeout(() => row.classList.remove("is-copied"), 900);
+    toast("Copied");
   } catch (error) {
-    handleError(error);
+    if (item.inline) {
+      openViewer(item);
+      return;
+    }
+    toast(messageFor(error), "error");
   }
 }
 
@@ -724,11 +721,11 @@ function downloadItem(item: ClipItem): void {
   link.remove();
 }
 
-async function deleteItem(item: ClipItem): Promise<void> {
+async function removeItem(item: ClipItem): Promise<void> {
   try {
     state.clipboard = await api.removeItem(item.id);
+    state.texts.delete(item.id);
     updateWorkspace();
-    toast("Item deleted");
   } catch (error) {
     handleError(error);
   }
@@ -737,19 +734,18 @@ async function deleteItem(item: ClipItem): Promise<void> {
 async function clearAll(): Promise<void> {
   const count = state.clipboard?.itemCount ?? 0;
   if (count === 0) return;
-
-  const confirmed = await confirmDialog({
-    title: "Clear this clipboard?",
-    message: `${count} ${count === 1 ? "item" : "items"} will be deleted permanently. This can't be undone.`,
-    confirmLabel: "Clear all",
-    destructive: true,
+  const confirmed = await confirmSheet({
+    title: "Clear everything?",
+    text: `${count} ${count === 1 ? "item" : "items"} will be deleted. This cannot be undone.`,
+    confirm: "Clear",
   });
   if (!confirmed) return;
 
   try {
     state.clipboard = await api.clearClipboard();
+    state.texts.clear();
     updateWorkspace();
-    toast("Clipboard cleared");
+    toast("Cleared");
   } catch (error) {
     handleError(error);
   }
@@ -759,31 +755,32 @@ async function disconnect(): Promise<void> {
   try {
     await api.endSession();
   } catch {
-    // The cookie may already be gone; disconnecting locally is still correct.
+    // The cookie may already be gone; leaving locally is still correct.
   }
-  forgetToken();
-  state.token = null;
+  forget();
+  state.code = null;
   state.clipboard = null;
   state.pending = [];
+  state.texts.clear();
   lastSignature = "";
-  renderAuth();
+  renderLanding();
 }
 
-/* -------------------------------------------------------------- refreshing */
+/* ------------------------------------------------------------------ syncing */
 
-let pollTimer: number | null = null;
+let timer: number | null = null;
 
 function startPolling(): void {
   stopPolling();
-  pollTimer = window.setInterval(() => {
+  timer = window.setInterval(() => {
     if (document.visibilityState === "visible" && state.clipboard && !state.busy) void refresh();
-  }, POLL_INTERVAL_MS);
+  }, POLL_MS);
 }
 
 function stopPolling(): void {
-  if (pollTimer !== null) {
-    window.clearInterval(pollTimer);
-    pollTimer = null;
+  if (timer !== null) {
+    window.clearInterval(timer);
+    timer = null;
   }
 }
 
@@ -794,10 +791,13 @@ async function refresh(): Promise<void> {
   } catch (error) {
     if (error instanceof api.ApiError && (error.status === 401 || error.status === 410)) {
       const expired = error.status === 410;
-      forgetToken();
-      state.token = null;
+      forget();
+      state.code = null;
       state.clipboard = null;
-      renderAuth(expired ? "That clipboard expired. Create a new one to continue." : "Your session ended. Connect again.");
+      lastSignature = "";
+      renderLanding({
+        message: expired ? "That clipboard expired. Create a new one." : "Your session ended. Enter your code again.",
+      });
     }
   }
 }
@@ -810,7 +810,7 @@ function handleError(error: unknown): void {
   toast(messageFor(error), "error");
 }
 
-/* ------------------------------------------------------- global interactions */
+/* -------------------------------------------------------- global interactions */
 
 function installGlobalHandlers(): void {
   document.addEventListener("paste", (event) => {
@@ -831,7 +831,14 @@ function installGlobalHandlers(): void {
     const text = data.getData("text/plain");
     if (text.trim().length > 0) {
       event.preventDefault();
-      void addText(text);
+      void api
+        .addText(text)
+        .then((result) => {
+          state.clipboard = result.clipboard;
+          updateWorkspace();
+          toast("Saved");
+        })
+        .catch(handleError);
     }
   });
 
@@ -840,19 +847,19 @@ function installGlobalHandlers(): void {
     if (!event.dataTransfer?.types.includes("Files")) return;
     event.preventDefault();
     event.dataTransfer.dropEffect = "copy";
-    composer()?.classList.add("is-dragging");
+    root.querySelector("#composer")?.classList.add("is-dropping");
   });
 
   document.addEventListener("dragleave", (event) => {
-    if (event.relatedTarget === null) composer()?.classList.remove("is-dragging");
+    if (event.relatedTarget === null) root.querySelector("#composer")?.classList.remove("is-dropping");
   });
 
   document.addEventListener("drop", (event) => {
     if (!state.clipboard) return;
     const files = Array.from(event.dataTransfer?.files ?? []);
+    root.querySelector("#composer")?.classList.remove("is-dropping");
     if (files.length === 0) return;
     event.preventDefault();
-    composer()?.classList.remove("is-dragging");
     void uploadFiles(files);
   });
 
@@ -865,39 +872,42 @@ function installGlobalHandlers(): void {
   }, 30_000);
 }
 
-/* -------------------------------------------------------------------- boot */
+/* ---------------------------------------------------------------------- boot */
 
-async function resume(token: string): Promise<void> {
+async function resume(code: string): Promise<void> {
   try {
-    const response = await api.connect(token);
+    const response = await api.connect(code);
+    state.code = code;
     state.clipboard = response.clipboard;
     renderWorkspace();
   } catch (error) {
-    if (error instanceof api.ApiError && (error.status === 401 || error.status === 410)) {
-      forgetToken();
-      state.token = null;
-      renderAuth(
-        error.status === 410 ? "That clipboard expired. Create a new one to continue." : "That token is no longer valid.",
-      );
+    forget();
+    state.code = null;
+    if (error instanceof api.ApiError && error.status === 410) {
+      renderLanding({ message: "That clipboard expired. Create a new one." });
       return;
     }
-    renderAuth(messageFor(error));
+    if (error instanceof api.ApiError && error.status === 401) {
+      renderLanding({ message: "That code doesn't exist anymore." });
+      return;
+    }
+    renderLanding({ message: messageFor(error) });
   }
 }
 
 installGlobalHandlers();
 
-const savedToken = (() => {
+const saved = (() => {
   try {
-    return localStorage.getItem(TOKEN_KEY);
+    return localStorage.getItem(STORE_KEY);
   } catch {
     return null;
   }
 })();
 
-if (savedToken) {
-  state.token = savedToken;
-  void resume(savedToken);
+if (saved) {
+  state.code = saved;
+  void resume(saved);
 } else {
-  renderAuth();
+  renderLanding();
 }
