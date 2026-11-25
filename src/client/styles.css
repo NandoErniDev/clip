@@ -697,6 +697,34 @@ button {
   border-radius: var(--radius-sm);
 }
 
+.sheet__input {
+  width: 100%;
+  height: 46px;
+  padding: 0 13px;
+  background: var(--bg);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  font-size: 16px;
+  letter-spacing: -0.01em;
+}
+
+.sheet__input::placeholder {
+  color: var(--faint);
+}
+
+.sheet__input:focus,
+.sheet__input:focus-visible {
+  outline: none;
+  border-color: var(--ink);
+}
+
+.sheet__error {
+  margin: 10px 0 0;
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--danger);
+}
+
 .code-box {
   padding: 14px;
   background: var(--surface-2);
