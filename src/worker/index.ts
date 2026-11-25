@@ -20,6 +20,7 @@ import {
   createClipboardRow,
   deleteItemRow,
   deletePendingUpload,
+  findClipboardByTokenHash,
   getClipboard,
   getItemRow,
   hitRateLimit,
@@ -34,7 +35,7 @@ import {
 import { HttpError, clientIp, ensureSameOrigin, errorResponse, jsonResponse, readJson } from "./http";
 import { contentDisposition, isInlinePreview, resolveMime, sanitizeFilename } from "./mime";
 import { deleteClipboardObjects, deleteObject, itemKey, putItemObject } from "./storage";
-import { generateToken, hashToken, normalizeToken } from "./token";
+import { CODE_RULES, generateToken, hashToken, isTokenFormat, normalizeToken, tokenFingerprint } from "./token";
 import type { AppEnv, Env } from "./types";
 
 const app = new Hono<AppEnv>();
@@ -134,9 +135,18 @@ app.post("/api/session", async (c) => {
 
   const body = await readJson<{ token?: unknown }>(c.req.raw, 4096);
   const rawToken = typeof body.token === "string" ? body.token.trim() : "";
-  if (!rawToken) throw new HttpError(400, "missing_token", "Enter an access token to continue.");
+  if (!rawToken) throw new HttpError(400, "missing_token", "Enter a code to continue.");
 
   const normalized = normalizeToken(rawToken);
+  if (isTokenFormat(normalized)) {
+    // Guessing a short code is throttled per code as well as per client.
+    await enforceRateLimit(
+      c.env.DB,
+      `connect-code:${tokenFingerprint(await hashToken(normalized))}`,
+      RATE_LIMITS.connectPerCode,
+    );
+  }
+
   const clipboard = await authenticate(c.env, new Request(c.req.url, {
     headers: { authorization: `Bearer ${normalized}` },
   }));
@@ -146,22 +156,43 @@ app.post("/api/session", async (c) => {
   return jsonResponse(payload, 200, { "set-cookie": sessionCookie(normalized, c.req.raw) });
 });
 
-/** Creates a clipboard and returns its token exactly once. */
+/** Creates a clipboard and returns its code exactly once. */
 app.post("/api/clipboards", async (c) => {
   const ip = clientIp(c.req.raw);
   await enforceRateLimit(c.env.DB, `create:${ip}`, RATE_LIMITS.createClipboard);
 
+  // The user may choose a code; otherwise a random one is generated.
+  const body = await readJson<{ token?: unknown }>(c.req.raw, 4096).catch(() => ({ token: undefined }) as { token?: unknown });
+  const requested = typeof body.token === "string" ? normalizeToken(body.token) : "";
+  if (requested && !isTokenFormat(requested)) {
+    throw new HttpError(
+      400,
+      "invalid_code",
+      `Codes use letters, numbers, dot, dash or underscore, ${CODE_RULES.minLength}–${CODE_RULES.maxLength} characters.`,
+    );
+  }
+
   const now = Date.now();
-  const token = generateToken();
+  const token = requested || generateToken();
   const normalized = normalizeToken(token);
+  const tokenHash = await hashToken(normalized);
   const clipboardId = crypto.randomUUID();
 
-  await createClipboardRow(c.env.DB, {
-    id: clipboardId,
-    tokenHash: await hashToken(normalized),
-    now,
-    expiresAt: now + LIMITS.clipboardTtlMs,
-  });
+  if (requested && (await findClipboardByTokenHash(c.env.DB, tokenHash))) {
+    throw new HttpError(409, "code_taken", "That code is already in use. Pick another one.");
+  }
+
+  try {
+    await createClipboardRow(c.env.DB, {
+      id: clipboardId,
+      tokenHash,
+      now,
+      expiresAt: now + LIMITS.clipboardTtlMs,
+    });
+  } catch (error) {
+    if (requested) throw new HttpError(409, "code_taken", "That code is already in use. Pick another one.");
+    throw error;
+  }
 
   const row = await getClipboard(c.env.DB, clipboardId);
   if (!row) throw new HttpError(500, "internal", "Could not create the clipboard.");
