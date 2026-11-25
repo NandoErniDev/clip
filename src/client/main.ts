@@ -1,5 +1,5 @@
 import { LIMITS } from "../shared/config";
-import type { ClipItem, ClipboardState } from "../shared/types";
+import type { ClipItem, ClipboardState, CreateClipboardResponse } from "../shared/types";
 import * as api from "./api";
 
 const STORE_KEY = "clip.code";
@@ -256,7 +256,7 @@ function renderLanding(options: { message?: string; code?: string } = {}): void 
   const describe = (): void => {
     const value = input?.value.trim() ?? "";
     if (!value) {
-      setHint(hint, "Leave the field empty to get a random code.", false);
+      setHint(hint, "Enter a code to connect, or create a new clipboard.", false);
     } else if (value.length < 3) {
       setHint(hint, "Codes are at least 3 characters.", false);
     } else {
@@ -278,8 +278,7 @@ function renderLanding(options: { message?: string; code?: string } = {}): void 
   });
 
   createButton?.addEventListener("click", () => {
-    const value = input?.value.trim() ?? "";
-    void create(value || undefined, createButton, hint);
+    void startNew();
   });
 
   input?.focus();
@@ -303,23 +302,80 @@ async function connect(code: string, button: HTMLButtonElement | null, hint: HTM
   }
 }
 
-async function create(code: string | undefined, button: HTMLButtonElement | null, hint: HTMLElement | null): Promise<void> {
-  setBusy(button, true, "Creating…");
-  try {
-    const response = await api.createClipboard(code);
-    remember(response.token);
-    state.code = response.token;
-    state.clipboard = response.clipboard;
-    renderWorkspace();
-    showCode(response.token);
-  } catch (error) {
-    if (hint) {
-      hint.textContent = messageFor(error);
-      hint.classList.add("is-error");
-    }
-  } finally {
-    setBusy(button, false, "New clipboard");
-  }
+/** Asks for a code, then creates the clipboard. Empty input means a random code. */
+async function startNew(): Promise<void> {
+  const response = await askCode();
+  if (!response) return;
+  remember(response.token);
+  state.code = response.token;
+  state.clipboard = response.clipboard;
+  renderWorkspace();
+  showCode(response.token);
+}
+
+function askCode(): Promise<CreateClipboardResponse | null> {
+  return new Promise((resolve) => {
+    const { dialog, close } = sheet(`
+      <h2 class="sheet__title">New clipboard</h2>
+      <p class="sheet__text">Pick a code you'll remember, or leave it empty for a random one.</p>
+      <input class="sheet__input" type="text" placeholder="Your code" autocomplete="off"
+        autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="done" />
+      <p class="sheet__error" hidden></p>
+      <div class="sheet__actions">
+        <button class="btn" type="button" data-cancel>Cancel</button>
+        <button class="btn btn--fill" type="button" data-create>Create</button>
+      </div>
+    `);
+
+    const input = dialog.querySelector<HTMLInputElement>(".sheet__input");
+    const error = dialog.querySelector<HTMLElement>(".sheet__error");
+    const createButton = dialog.querySelector<HTMLButtonElement>("[data-create]");
+
+    const finish = (value: CreateClipboardResponse | null): void => {
+      close();
+      resolve(value);
+    };
+
+    const fail = (message: string): void => {
+      if (!error) return;
+      error.textContent = message;
+      error.hidden = false;
+    };
+
+    const submit = async (): Promise<void> => {
+      const value = input?.value.trim() ?? "";
+      if (value && !/^[a-z0-9._-]{3,64}$/i.test(value)) {
+        fail("3–64 characters: letters, numbers, . - _");
+        input?.focus();
+        return;
+      }
+      if (error) error.hidden = true;
+      if (createButton) {
+        createButton.disabled = true;
+        createButton.textContent = "Creating…";
+      }
+      try {
+        finish(await api.createClipboard(value || undefined));
+      } catch (problem) {
+        fail(messageFor(problem));
+        if (createButton) {
+          createButton.disabled = false;
+          createButton.textContent = "Create";
+        }
+        input?.focus();
+      }
+    };
+
+    dialog.querySelector("[data-cancel]")?.addEventListener("click", () => finish(null));
+    createButton?.addEventListener("click", () => void submit());
+    input?.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter") return;
+      event.preventDefault();
+      void submit();
+    });
+
+    input?.focus();
+  });
 }
 
 function setBusy(button: HTMLButtonElement | null, busy: boolean, label: string): void {
