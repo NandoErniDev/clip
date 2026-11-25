@@ -32,12 +32,12 @@ export async function authenticate(env: Env, request: Request): Promise<Clipboar
 
   const normalized = normalizeToken(token);
   if (!isTokenFormat(normalized)) {
-    throw new HttpError(401, "invalid_token", "That access token isn't valid.");
+    throw new HttpError(401, "invalid_token", "That code doesn't exist.");
   }
 
   const clipboard = await findClipboardByTokenHash(env.DB, await hashToken(normalized));
   if (!clipboard) {
-    throw new HttpError(401, "invalid_token", "That access token isn't valid.");
+    throw new HttpError(401, "invalid_token", "That code doesn't exist.");
   }
 
   if (clipboard.expires_at <= Date.now()) {
