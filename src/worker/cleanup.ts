@@ -10,7 +10,6 @@ import { LIMITS } from "../shared/config";
 import {
   deleteClipboardRows,
   deletePendingUpload,
-  findKnownR2Keys,
   listExpiredClipboardIds,
   listStalePendingUploads,
   pruneRateLimits,
@@ -29,7 +28,7 @@ export interface MaintenanceStats {
 }
 
 export async function destroyClipboard(env: Env, clipboardId: string): Promise<void> {
-  await deleteClipboardObjects(env.FILES, clipboardId);
+  await deleteClipboardObjects(env.DB, clipboardId);
   await deleteClipboardRows(env.DB, clipboardId);
 }
 
@@ -48,7 +47,7 @@ export async function runMaintenance(env: Env, options: { maxClipboards?: number
   // 1. Expired clipboards: remove objects first, then metadata.
   const expiredIds = await listExpiredClipboardIds(env.DB, now, options.maxClipboards ?? 50);
   for (const id of expiredIds) {
-    stats.expiredObjects += await deleteClipboardObjects(env.FILES, id);
+    stats.expiredObjects += await deleteClipboardObjects(env.DB, id);
     await deleteClipboardRows(env.DB, id);
     stats.expiredClipboards += 1;
   }
@@ -56,14 +55,14 @@ export async function runMaintenance(env: Env, options: { maxClipboards?: number
   // 2. Uploads that never completed (interrupted between reservation and write).
   const staleUploads = await listStalePendingUploads(env.DB, now - LIMITS.pendingUploadTtlMs, 50);
   for (const upload of staleUploads) {
-    await deleteObject(env.FILES, upload.r2_key);
+    await deleteObject(env.DB, upload.r2_key);
     await deletePendingUpload(env.DB, upload.id);
     await recomputeCounters(env.DB, upload.clipboard_id, now);
     stats.staleUploads += 1;
   }
 
   // 3. Safety net for objects whose metadata vanished in an interrupted run.
-  stats.orphanObjects = await sweepOrphanObjects(env.FILES, (keys) => findKnownR2Keys(env.DB, keys), now);
+  stats.orphanObjects = await sweepOrphanObjects(env.DB, now);
 
   // 4. Drop counters that drifted because of an interrupted multi-step write.
   await env.DB.prepare(

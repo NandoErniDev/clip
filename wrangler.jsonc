@@ -16,14 +16,8 @@
     {
       "binding": "DB",
       "database_name": "clip-db",
-      "database_id": "00000000-0000-4000-8000-000000000000",
+      "database_id": "030cb4cb-ca4a-4981-84f7-890e274f26b5",
       "migrations_dir": "migrations"
-    }
-  ],
-  "r2_buckets": [
-    {
-      "binding": "FILES",
-      "bucket_name": "clip-files"
     }
   ],
   "triggers": {

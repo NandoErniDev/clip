@@ -2,8 +2,8 @@
  * Clip Worker.
  *
  * Serves the single-page client from Workers static assets and the clipboard
- * API from D1 (metadata) and R2 (file bytes). All limits are enforced here,
- * never in the browser.
+ * API from D1 (metadata and file bytes). All limits are enforced here, never in
+ * the browser.
  */
 
 import { Hono } from "hono";
@@ -34,7 +34,7 @@ import {
 } from "./db";
 import { HttpError, clientIp, ensureSameOrigin, errorResponse, jsonResponse, readJson } from "./http";
 import { contentDisposition, isInlinePreview, resolveMime, sanitizeFilename } from "./mime";
-import { deleteClipboardObjects, deleteObject, itemKey, putItemObject } from "./storage";
+import { deleteClipboardObjects, deleteObject, getObject, itemKey, putItemObject } from "./storage";
 import { CODE_RULES, generateToken, hashToken, isTokenFormat, normalizeToken, tokenFingerprint } from "./token";
 import type { AppEnv, Env } from "./types";
 
@@ -333,11 +333,11 @@ async function createFileItem(c: Context<AppEnv>, clipboard: ClipboardRow): Prom
   });
 
   try {
-    await putItemObject(c.env.FILES, key, buffer, mime, { clipboardId: clipboard.id, itemId });
+    await putItemObject(c.env.DB, key, buffer, mime, { clipboardId: clipboard.id, itemId });
   } catch (error) {
     await deletePendingUpload(c.env.DB, pendingId).catch(() => undefined);
     await releaseCapacity(c.env.DB, clipboard.id, size);
-    console.error("r2 put failed", error instanceof Error ? error.message : String(error));
+    console.error("file put failed", error instanceof Error ? error.message : String(error));
     throw new HttpError(502, "storage_unavailable", "Upload failed. Please try again.");
   }
 
@@ -355,7 +355,7 @@ async function createFileItem(c: Context<AppEnv>, clipboard: ClipboardRow): Prom
     });
     await deletePendingUpload(c.env.DB, pendingId);
   } catch (error) {
-    await deleteObject(c.env.FILES, key);
+    await deleteObject(c.env.DB, key);
     await deletePendingUpload(c.env.DB, pendingId).catch(() => undefined);
     await releaseCapacity(c.env.DB, clipboard.id, size);
     throw error;
@@ -403,7 +403,7 @@ app.get("/api/items/:id/content", async (c) => {
 
   if (!item.r2_key) throw new HttpError(404, "not_found", "That item no longer exists.");
 
-  const object = await c.env.FILES.get(item.r2_key);
+  const object = await getObject(c.env.DB, item.r2_key);
   if (!object) {
     // Metadata without content: drop the row so the list self-heals.
     await deleteItemRow(c.env.DB, clipboard.id, item.id, Date.now());
@@ -429,7 +429,7 @@ app.delete("/api/items/:id", async (c) => {
   if (!item) throw new HttpError(404, "not_found", "That item no longer exists.");
 
   await deleteItemRow(c.env.DB, clipboard.id, item.id, Date.now());
-  if (item.r2_key) await deleteObject(c.env.FILES, item.r2_key);
+  if (item.r2_key) await deleteObject(c.env.DB, item.r2_key);
 
   return jsonResponse({ clipboard: await buildState(c.env.DB, clipboard) });
 });
@@ -440,7 +440,7 @@ app.delete("/api/clipboard/items", async (c) => {
 
   await clearItemRows(c.env.DB, clipboard.id, Date.now());
   // Remove every object for the clipboard, including any orphaned upload.
-  await deleteClipboardObjects(c.env.FILES, clipboard.id);
+  await deleteClipboardObjects(c.env.DB, clipboard.id);
 
   return jsonResponse({ clipboard: await buildState(c.env.DB, clipboard) });
 });

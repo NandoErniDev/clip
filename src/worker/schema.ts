@@ -53,6 +53,17 @@ const STATEMENTS = [
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
   )`,
+  `CREATE TABLE IF NOT EXISTS file_chunks (
+    object_key TEXT NOT NULL,
+    chunk_index INTEGER NOT NULL,
+    data BLOB NOT NULL,
+    mime TEXT NOT NULL,
+    clipboard_id TEXT NOT NULL,
+    item_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (object_key, chunk_index)
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_file_chunks_created ON file_chunks (created_at)`,
 ];
 
 let ready: Promise<void> | null = null;
