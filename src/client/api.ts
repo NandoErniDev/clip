@@ -41,8 +41,13 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   return (await response.json()) as T;
 }
 
-export async function createClipboard(): Promise<CreateClipboardResponse> {
-  return await request<CreateClipboardResponse>("/api/clipboards", { method: "POST" });
+export async function createClipboard(code?: string): Promise<CreateClipboardResponse> {
+  if (!code) return await request<CreateClipboardResponse>("/api/clipboards", { method: "POST" });
+  return await request<CreateClipboardResponse>("/api/clipboards", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ token: code }),
+  });
 }
 
 export async function connect(token: string): Promise<SessionResponse> {
@@ -92,6 +97,12 @@ export async function fetchText(item: ClipItem): Promise<string> {
   const response = await fetch(item.contentUrl, { credentials: "same-origin" });
   if (!response.ok) throw new ApiError(response.status, "content_unavailable", "The text could not be read.");
   return await response.text();
+}
+
+export async function fetchBlob(item: ClipItem): Promise<Blob> {
+  const response = await fetch(item.contentUrl, { credentials: "same-origin" });
+  if (!response.ok) throw new ApiError(response.status, "content_unavailable", "The file could not be read.");
+  return await response.blob();
 }
 
 export function downloadUrl(item: ClipItem): string {

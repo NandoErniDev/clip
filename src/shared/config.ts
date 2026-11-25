@@ -26,6 +26,8 @@ export const LIMITS = {
 export const RATE_LIMITS = {
   createClipboard: { limit: 12, windowMs: 60 * 60 * 1000 },
   connect: { limit: 40, windowMs: 10 * 60 * 1000 },
+  /** Per code, so a chosen short code cannot be brute-forced from many hosts. */
+  connectPerCode: { limit: 20, windowMs: 10 * 60 * 1000 },
   write: { limit: 240, windowMs: 60 * 1000 },
   read: { limit: 600, windowMs: 60 * 1000 },
 } as const;
