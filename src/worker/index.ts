@@ -13,6 +13,8 @@ import { LIMITS, RATE_LIMITS } from "../shared/config";
 import type { ApiErrorBody, ClipItem, ClipboardState, CreateClipboardResponse, ItemResponse, SessionResponse } from "../shared/types";
 import { authenticate, clearedSessionCookie, sessionCookie } from "./auth";
 import { runMaintenance } from "./cleanup";
+import { maybeRunMaintenance } from "./maintenance";
+import { ensureSchema } from "./schema";
 import {
   clearItemRows,
   createClipboardRow,
@@ -104,6 +106,14 @@ async function assertCapacity(db: D1Database, clipboardId: string, size: number)
 }
 
 /* --------------------------------------------------------------- middleware */
+
+app.use("/api/*", async (c, next) => {
+  // Managed hosts may not run the D1 migrations or a Cron Trigger, so the
+  // Worker makes a fresh database usable and schedules cleanup itself.
+  await ensureSchema(c.env);
+  c.executionCtx.waitUntil(maybeRunMaintenance(c.env, c.executionCtx));
+  await next();
+});
 
 app.use("*", async (c, next) => {
   // Opening a session carries the token in the body, so a non-browser client
@@ -470,6 +480,7 @@ export default {
   },
 
   async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    await ensureSchema(env);
     ctx.waitUntil(
       runMaintenance(env)
         .then((stats) => console.log("clip:maintenance", JSON.stringify(stats)))
